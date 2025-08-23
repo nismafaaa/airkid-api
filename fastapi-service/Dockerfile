@@ -1,30 +1,26 @@
-FROM python:3.9-slim
+# syntax=docker/dockerfile:1
+FROM python:3.11-slim
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1
 
 WORKDIR /app
 
-RUN apt-get update && apt-get install -y \
-    gcc \
-    g++ \
-    && rm -rf /var/lib/apt/lists/*
+# System deps (optional but helpful for scientific libs)
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential \
+  && rm -rf /var/lib/apt/lists/*
 
-COPY requirements.txt .
-
+# Install Python deps
+# If you have requirements.txt, this will use it. Otherwise, add your deps here.
+COPY requirements.txt /app/requirements.txt
 RUN pip install --no-cache-dir -r requirements.txt
 
-RUN pip install --no-cache-dir "scikit-learn==1.2.2"
+# Copy app code and models
+COPY . /app
 
-COPY app.py .
-COPY pm25_predictor.py .
+# Default port (Cloud Run sets $PORT; fallback to 8080 for local)
+ENV PORT=8080
 
-COPY models/ ./models/
-
-RUN useradd -m -u 1000 appuser && chown -R appuser:appuser /app
-USER appuser
-
-ENV TF_CPP_MIN_LOG_LEVEL=2
-ENV CUDA_VISIBLE_DEVICES="-1"
-ENV TF_ENABLE_ONEDNN_OPTS=0
-
-EXPOSE 8080
-
-CMD ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8080"]
+# Run the app
+CMD ["sh", "-c", "uvicorn app:app --host 0.0.0.0 --port ${PORT:-8080}"]
