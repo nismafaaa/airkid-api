@@ -5,7 +5,13 @@ from pm25_predictor import PM25Predictor
 import asyncpg
 from typing import Optional
 from urllib.parse import urlparse, urlunparse
-from datetime import datetime  # removed timezone
+from datetime import datetime, timedelta
+import logging
+from google.cloud import aiplatform
+from google.cloud import logging as gcloud_logging
+from google.cloud import monitoring_v3
+from google.api import metric_pb2, monitored_resource_pb2
+from google.protobuf import timestamp_pb2
 
 app = FastAPI(title="PM2.5 Forecast API")
 
@@ -14,6 +20,49 @@ predictor = PM25Predictor("models")
 db_pool: Optional[asyncpg.pool.Pool] = None
 last_db_error: Optional[str] = None
 last_db_url_masked: Optional[str] = None
+
+GCP_PROJECT = os.getenv("GCP_PROJECT")
+GCP_LOCATION = os.getenv("GCP_LOCATION")
+GCS_BUCKET = os.getenv("GCS_BUCKET")  
+VERTEX_REGISTER_ON_STARTUP = os.getenv("VERTEX_REGISTER_ON_STARTUP", "false").lower() == "true"
+VERTEX_PREDICTION_IMAGE = os.getenv("VERTEX_PREDICTION_IMAGE") or "us-docker.pkg.dev/vertex-ai/prediction/tf2-cpu.2-15:latest"
+MODEL_NAME = os.getenv("MODEL_NAME", "pm25-predictor")
+MODEL_VERSION = os.getenv("MODEL_VERSION")  
+_vertex_model_resource: Optional[str] = None
+_monitoring_client: Optional[monitoring_v3.MetricServiceClient] = None
+last_vertex_error: Optional[str] = None  
+VERTEX_SKIP_REGISTER_IF_EXISTS = os.getenv("VERTEX_SKIP_REGISTER_IF_EXISTS", "true").lower() == "true"  # new
+
+SUPPORTED_VERTEX_FILES = {
+    "model.pkl", "model.joblib", "model.bst", "model.mar", "saved_model.pb", "saved_model.pbtxt"
+}
+
+def _find_vertex_artifact_path(base_dir: str) -> Optional[str]:
+    """
+    Recursively search for a supported artifact. For SavedModel, return its folder.
+    For file-based models, return the file path.
+    """
+    try:
+        for root, _, files in os.walk(base_dir):
+            if "saved_model.pb" in files or "saved_model.pbtxt" in files:
+                return root
+            for f in files:
+                if f in ("model.pkl", "model.joblib", "model.bst", "model.mar"):
+                    return os.path.join(root, f)
+    except Exception:
+        return None
+    return None
+
+def _get_vertex_runtime_staging_bucket() -> Optional[str]:
+    """Return the SDK's currently configured staging bucket."""
+    try:
+        return getattr(aiplatform.initializer.global_config, "staging_bucket", None)
+    except Exception:
+        return None
+
+def _display_name(display_name_override: Optional[str]) -> str:
+    """Consistent display_name builder."""
+    return display_name_override or f"{MODEL_NAME}{('-' + MODEL_VERSION) if MODEL_VERSION else ''}"
 
 def _build_db_url_from_env() -> Optional[str]:
     url = os.getenv("DATABASE_URL")
@@ -56,6 +105,170 @@ def _mask_db_url(url: str) -> str:
     except Exception:
         return "<masked>"
 
+def _init_gcp():
+    global _monitoring_client
+    if not GCP_PROJECT:
+        return
+    try:
+        gcloud_logging.Client(project=GCP_PROJECT).setup_logging()  
+    except Exception:
+        pass
+    try:
+        staging = None
+        if GCS_BUCKET:
+            staging = GCS_BUCKET if GCS_BUCKET.startswith("gs://") else f"gs://{GCS_BUCKET}"
+        aiplatform.init(project=GCP_PROJECT, location=GCP_LOCATION, staging_bucket=staging)
+        logging.info({
+            "event": "vertex_init",
+            "project": GCP_PROJECT,
+            "location": GCP_LOCATION,
+            "staging_bucket_env": staging,
+            "staging_bucket_runtime": _get_vertex_runtime_staging_bucket(),
+        })
+    except Exception as e:
+        logging.warning({"event": "vertex_init_failed", "error": str(e)})
+    try:
+        _monitoring_client = monitoring_v3.MetricServiceClient()
+    except Exception:
+        _monitoring_client = None
+
+def _register_model_in_vertex(models_dir: str = "models", display_name: Optional[str] = None, artifact_path: Optional[str] = None):
+    global _vertex_model_resource, last_vertex_error
+    if not GCP_PROJECT:
+        last_vertex_error = "GCP_PROJECT not set"
+        return {"status": "error", "error": last_vertex_error}
+
+    try:
+        dn = _display_name(display_name)
+
+        # Skip if a model with the same display_name already exists (prevents duplicates)
+        if VERTEX_SKIP_REGISTER_IF_EXISTS:
+            try:
+                existing = aiplatform.Model.list(filter=f'display_name="{dn}"')
+                if existing:
+                    _vertex_model_resource = existing[0].resource_name
+                    last_vertex_error = None
+                    logging.info({"event": "vertex_model_exists", "model": _vertex_model_resource, "display_name": dn})
+                    return {"status": "exists", "model_resource": _vertex_model_resource, "display_name": dn}
+            except Exception as list_err:
+                logging.warning({"event": "vertex_list_failed", "error": str(list_err)})
+
+        local_dir = models_dir
+        if not (local_dir and os.path.isdir(local_dir)):
+            last_vertex_error = f"models_dir not found: {local_dir}"
+            logging.warning({"event": "vertex_model_register_failed", "error": last_vertex_error})
+            return {"status": "error", "error": last_vertex_error}
+
+        has_files = any(True for _ in os.scandir(local_dir))
+        if not has_files:
+            last_vertex_error = f"models_dir is empty: {local_dir}"
+            logging.warning({"event": "vertex_model_register_failed", "error": last_vertex_error})
+            return {"status": "error", "error": last_vertex_error}
+
+        artifact_uri = artifact_path or _find_vertex_artifact_path(local_dir) or _find_vertex_artifact_path("/tmp")
+        if not artifact_uri:
+            try:
+                export_dir = predictor.get_saved_model_dir()
+                if not export_dir:
+                    export_dir = os.getenv("VERTEX_EXPORT_DIR") or "/tmp/tf_saved_model"
+                    export_dir = predictor.export_saved_model(export_dir=export_dir, overwrite=True)
+                if os.path.isfile(os.path.join(export_dir, "saved_model.pb")):
+                    artifact_uri = export_dir
+            except Exception as export_err:
+                logging.warning({"event": "vertex_export_failed", "error": str(export_err)})
+
+        if not artifact_uri:
+            last_vertex_error = (
+                f"artifact_uri directory does not contain supported files: {sorted(list(SUPPORTED_VERTEX_FILES))}. "
+                f"Put one of these under {local_dir} or /tmp (recursively), "
+                f"set VERTEX_EXPORT_DIR to a writable path (e.g. /tmp/tf_saved_model), "
+                f"or pass ?artifact_path=/path/to/file_or_dir"
+            )
+            logging.warning({"event": "vertex_model_register_failed", "error": last_vertex_error})
+            return {"status": "error", "error": last_vertex_error}
+
+        model = aiplatform.Model.upload(
+            display_name=dn,
+            artifact_uri=artifact_uri,  
+            serving_container_image_uri=VERTEX_PREDICTION_IMAGE,
+            description="PM2.5 predictor registered from FastAPI service",
+            labels={"app": "pm25-forecast"},
+        )
+        _vertex_model_resource = model.resource_name
+        last_vertex_error = None
+        logging.info({"event": "vertex_model_registered", "model": _vertex_model_resource, "display_name": dn, "artifact_uri": artifact_uri})
+        return {"status": "success", "model_resource": _vertex_model_resource, "display_name": dn, "artifact_uri": artifact_uri}
+    except Exception as e:
+        last_vertex_error = str(e)
+        logging.warning({"event": "vertex_model_register_failed", "error": last_vertex_error})
+        return {"status": "error", "error": last_vertex_error}
+
+def _log_forecast_event(city: str, pollutant: str, input_mode: str, forecast: list, persisted: int):
+    try:
+        logging.info({
+            "event": "forecast_model_run",
+            "city": city,
+            "pollutant": pollutant,
+            "horizon": len(forecast),
+            "first_day": forecast[0]["day"] if forecast else None,
+            "last_day": forecast[-1]["day"] if forecast else None,
+            "avg_mean": float(pd.Series([f["avg"] for f in forecast]).mean()) if forecast else None,
+            "persisted": persisted,
+            "model_input": input_mode,
+            "vertex_model": _vertex_model_resource,
+        })
+    except Exception:
+        pass
+
+def _ensure_metric_descriptor(metric_type: str, value_type: metric_pb2.MetricDescriptor.ValueType, unit: str, description: str):
+    if not _monitoring_client or not GCP_PROJECT:
+        return
+    name = f"projects/{GCP_PROJECT}"
+    md = metric_pb2.MetricDescriptor()
+    md.type = metric_type
+    md.metric_kind = metric_pb2.MetricDescriptor.MetricKind.GAUGE
+    md.value_type = value_type
+    md.unit = unit
+    md.description = description
+    md.display_name = metric_type.split("/")[-1]
+    try:
+        _monitoring_client.create_metric_descriptor(name=name, metric_descriptor=md)
+    except Exception:
+        pass
+
+def _publish_forecast_metrics(city: str, forecast: list):
+    if not _monitoring_client or not GCP_PROJECT:
+        return
+    _ensure_metric_descriptor("custom.googleapis.com/pm25/forecast/horizon", metric_pb2.MetricDescriptor.ValueType.INT64, "1", "PM2.5 forecast horizon length")
+    _ensure_metric_descriptor("custom.googleapis.com/pm25/forecast/avg_mean", metric_pb2.MetricDescriptor.ValueType.DOUBLE, "1", "Mean of forecasted PM2.5 avg values")
+    now = datetime.utcnow()
+    ts = timestamp_pb2.Timestamp()
+    ts.FromDatetime(now)
+    interval = monitoring_v3.TimeInterval(end_time=ts)
+    resource = monitored_resource_pb2.MonitoredResource(type="global", labels={"project_id": GCP_PROJECT})
+    horizon = len(forecast)
+    series1 = monitoring_v3.TimeSeries()
+    series1.metric.type = "custom.googleapis.com/pm25/forecast/horizon"
+    series1.metric.labels["city"] = city
+    series1.resource.CopyFrom(resource)
+    point1 = monitoring_v3.Point()
+    point1.interval.CopyFrom(interval)
+    point1.value.int64_value = int(horizon)
+    series1.points.append(point1)
+    mean_val = float(pd.Series([f["avg"] for f in forecast]).mean()) if forecast else 0.0
+    series2 = monitoring_v3.TimeSeries()
+    series2.metric.type = "custom.googleapis.com/pm25/forecast/avg_mean"
+    series2.metric.labels["city"] = city
+    series2.resource.CopyFrom(resource)
+    point2 = monitoring_v3.Point()
+    point2.interval.CopyFrom(interval)
+    point2.value.double_value = mean_val
+    series2.points.append(point2)
+    try:
+        _monitoring_client.create_time_series(name=f"projects/{GCP_PROJECT}", time_series=[series1, series2])
+    except Exception:
+        pass
+
 @app.on_event("startup")
 async def on_startup():
     global db_pool, last_db_error, last_db_url_masked
@@ -71,6 +284,12 @@ async def on_startup():
         except Exception as e:
             last_db_error = str(e)
             db_pool = None
+    try:
+        _init_gcp()
+        if VERTEX_REGISTER_ON_STARTUP:
+            _register_model_in_vertex("models")
+    except Exception:
+        pass
 
 @app.on_event("shutdown")
 async def on_shutdown():
@@ -89,7 +308,13 @@ async def root():
         "model_usage": "GET /forecast-model?persist=true",
         "db_configured": bool(db_pool),
         "sequence_length": predictor.SEQ_LENGTH,
-        "future_days": predictor.FUTURE_DAYS
+        "future_days": predictor.FUTURE_DAYS,
+        "vertex": {
+            "project": GCP_PROJECT,
+            "location": GCP_LOCATION,
+            "staging_bucket": (GCS_BUCKET if GCS_BUCKET and GCS_BUCKET.startswith("gs://") else (f"gs://{GCS_BUCKET}" if GCS_BUCKET else None)),
+            "model_resource": _vertex_model_resource
+        }
     }
 
 @app.get("/get-forecast")
@@ -120,7 +345,7 @@ async def get_forecast(
           (l.max_idx <> -1 AND d.source_idx = l.max_idx)
           OR (l.max_idx = -1 AND d.created_at >= l.max_created - INTERVAL '10 minutes')
         )
-        AND d.day >= CURRENT_DATE
+        AND d.day > CURRENT_DATE
     )
     SELECT city, pollutant, day, avg, min, max, source_idx, created_at,
            run_source_idx, run_created_at
@@ -144,7 +369,7 @@ async def get_forecast(
           (l.max_idx <> -1 AND d.source_idx = l.max_idx)
           OR (l.max_idx = -1 AND d.created_at >= l.max_created - INTERVAL '10 minutes')
         )
-        AND d.day >= CURRENT_DATE
+        AND d.day > CURRENT_DATE
     )
     SELECT city, pollutant, source, day, avg, min, max, source_idx, created_at,
            run_source_idx, run_created_at
@@ -168,7 +393,7 @@ async def get_forecast(
           (l.max_idx <> -1 AND d.source_idx = l.max_idx)
           OR (l.max_idx = -1 AND d.created_at >= l.max_created - INTERVAL '10 minutes')
         )
-        AND d.day >= CURRENT_DATE
+        AND d.day > CURRENT_DATE
     )
     SELECT city, pollutant, source, day, avg, min, max, source_idx, created_at,
            run_source_idx, run_created_at
@@ -332,6 +557,8 @@ async def forecast_model(city: str = "Malang, Indonesia", persist: bool = False)
     if not db_pool:
         return {"status": "unavailable", "message": "Database not configured."}
 
+    today_date = datetime.utcnow().date()
+
     try:
         async with db_pool.acquire() as conn:
             rows = await _fetch_daily_pm25_history(conn, city)
@@ -383,18 +610,49 @@ async def forecast_model(city: str = "Malang, Indonesia", persist: bool = False)
                     "available_days_raw": available_raw
                 }
 
+        desired_horizon = 7
+        series_next = df.index.max().date() + timedelta(days=1)
+        start_date = max(series_next, today_date + timedelta(days=1))
+
         if "date" in preds.columns:
-            preds = preds.head(7)
-            dates = [pd.to_datetime(d).strftime("%Y-%m-%d") for d in preds["date"]]
-            values = preds["predicted_pm25"].tolist()
+            preds = preds.sort_values(by="date").copy()
+            preds["date"] = pd.to_datetime(preds["date"]).dt.date
+            filt = preds[preds["date"] >= start_date]
+
+            dates = [d.strftime("%Y-%m-%d") for d in filt["date"].iloc[:desired_horizon]]
+            values = filt["predicted_pm25"].iloc[:desired_horizon].tolist()
+
+            if len(dates) < desired_horizon:
+                if not dates:
+                    last_date = start_date - timedelta(days=1)
+                    last_val = preds["predicted_pm25"].iloc[-1]
+                else:
+                    last_date = datetime.strptime(dates[-1], "%Y-%m-%d").date()
+                    last_val = values[-1]
+                while len(dates) < desired_horizon:
+                    last_date = last_date + timedelta(days=1)
+                    dates.append(last_date.strftime("%Y-%m-%d"))
+                    values.append(last_val)
         else:
-            horizon = min(7, len(preds))
-            start_date = df.index.max() + pd.Timedelta(days=1)
-            dates = pd.date_range(start=start_date, periods=horizon, freq="D").strftime("%Y-%m-%d").tolist()
+
+            k = (start_date - series_next).days  
             if hasattr(preds, "columns") and "predicted_pm25" in preds.columns:
-                values = preds["predicted_pm25"].tolist()
+                seq = preds["predicted_pm25"].tolist()
             else:
-                values = list(preds[:horizon])
+                seq = list(preds)
+
+            seq = seq[k:] if k > 0 else seq
+
+            if len(seq) < desired_horizon and len(seq) > 0:
+                last_val = seq[-1]
+                seq = seq + [last_val] * (desired_horizon - len(seq))
+
+            values = seq[:desired_horizon]
+            dates = pd.date_range(
+                start=pd.Timestamp(start_date),
+                periods=desired_horizon,
+                freq="D"
+            ).strftime("%Y-%m-%d").tolist()
 
         forecast = [
             {"day": d, "avg": int(round(float(v))), "min": None, "max": None}
@@ -434,6 +692,12 @@ async def forecast_model(city: str = "Malang, Indonesia", persist: bool = False)
                 )
                 persisted = len(forecast)
 
+        try:
+            _log_forecast_event(city=city, pollutant="pm25", input_mode=input_mode, forecast=forecast, persisted=persisted if persist else 0)
+            _publish_forecast_metrics(city=city, forecast=forecast)
+        except Exception:
+            pass
+
         return {
             "status": "success",
             "city": city,
@@ -452,3 +716,68 @@ async def forecast_model(city: str = "Malang, Indonesia", persist: bool = False)
         }
     except Exception as e:
         return {"status": "error", "message": str(e)}
+
+@app.get("/vertex-info")
+async def vertex_info():
+    candidate_models = _find_vertex_artifact_path("models") if os.path.isdir("models") else None
+    candidate_tmp = _find_vertex_artifact_path("/tmp")
+    saved_model_dir = None
+    try:
+        saved_model_dir = predictor.get_saved_model_dir()
+    except Exception:
+        pass
+    return {
+        "project": GCP_PROJECT,
+        "location": GCP_LOCATION,
+        "staging_bucket": (GCS_BUCKET if GCS_BUCKET and GCS_BUCKET.startswith("gs://") else (f"gs://{GCS_BUCKET}" if GCS_BUCKET else None)),
+        "runtime_staging_bucket": _get_vertex_runtime_staging_bucket(),
+        "prediction_image": VERTEX_PREDICTION_IMAGE,
+        "model_name": MODEL_NAME,
+        "model_version": MODEL_VERSION,
+        "register_on_startup": VERTEX_REGISTER_ON_STARTUP,
+        "skip_register_if_exists": VERTEX_SKIP_REGISTER_IF_EXISTS,
+        "model_resource": _vertex_model_resource,
+        "last_error": last_vertex_error,
+        "candidate_artifact_models": candidate_models,
+        "candidate_artifact_tmp": candidate_tmp,
+        "saved_model_dir": saved_model_dir,
+        "supported_files": sorted(list(SUPPORTED_VERTEX_FILES)),
+        "hints": [
+            "If runtime_staging_bucket != staging_bucket, call /vertex/reinit?bucket=gs://<new-bucket>&location=<region>.",
+            "Update Cloud Run env GCS_BUCKET to persist across restarts."
+        ],
+    }
+
+@app.post("/vertex-reinit")
+async def vertex_reinit(bucket: Optional[str] = None, location: Optional[str] = None):
+    """
+    Reinitialize Vertex AI SDK with a new staging bucket and/or location at runtime.
+    Example: POST /vertex/reinit?bucket=gs://airkid-aqi-vertex-ase2&location=asia-southeast2
+    """
+    global GCS_BUCKET, GCP_LOCATION
+    new_bucket = bucket or GCS_BUCKET
+    if new_bucket and not new_bucket.startswith("gs://"):
+        new_bucket = f"gs://{new_bucket}"
+    new_location = location or GCP_LOCATION
+    try:
+        aiplatform.init(project=GCP_PROJECT, location=new_location, staging_bucket=new_bucket)
+        if bucket:
+            GCS_BUCKET = new_bucket
+        if location:
+            GCP_LOCATION = new_location
+        return {
+            "status": "ok",
+            "project": GCP_PROJECT,
+            "location": GCP_LOCATION,
+            "staging_bucket": GCS_BUCKET,
+            "runtime_staging_bucket": _get_vertex_runtime_staging_bucket(),
+        }
+    except Exception as e:
+        return {"status": "error", "error": str(e)}
+
+@app.post("/vertex-register")
+async def vertex_register(models_dir: str = "models", display_name: Optional[str] = None, artifact_path: Optional[str] = None):
+    """
+    Trigger Vertex Model upload. Optionally override artifact_path (file or SavedModel directory).
+    """
+    return _register_model_in_vertex(models_dir=models_dir, display_name=display_name, artifact_path=artifact_path)
