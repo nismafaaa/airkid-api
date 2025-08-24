@@ -115,8 +115,103 @@ def _extract_forecasts(payload: Dict[str, Any]) -> List[Dict[str, Any]]:
                 "min": r.get("min"),
                 "max": r.get("max"),
                 "source_idx": source_idx,
+                "source": "provider",
             })
     return out
+
+def _table_has_column(conn, table: str, column: str, schema: str = "public") -> bool:
+    row = conn.execute(
+        text(
+            """
+            SELECT EXISTS (
+              SELECT 1
+              FROM information_schema.columns
+              WHERE table_schema = :schema
+                AND table_name = :table
+                AND column_name = :column
+            )
+            """
+        ),
+        {"schema": schema, "table": table, "column": column},
+    ).scalar()
+    return bool(row)
+
+def _upsert_forecasts(conn, forecasts: List[Dict[str, Any]]):
+    if not forecasts:
+        return
+    has_source_col = _table_has_column(conn, "aqi_forecast_daily", "source")
+
+    if has_source_col:
+        # Ensure every row has source set
+        for f in forecasts:
+            f.setdefault("source", "provider")
+        try:
+            conn.execute(
+                text("""
+                    INSERT INTO aqi_forecast_daily
+                    (city, pollutant, day, avg, min, max, source, source_idx)
+                    VALUES
+                    (:city, :pollutant, :day, :avg, :min, :max, :source, :source_idx)
+                    ON CONFLICT (city, pollutant, day, source) DO UPDATE SET
+                      avg=EXCLUDED.avg,
+                      min=EXCLUDED.min,
+                      max=EXCLUDED.max,
+                      source_idx=EXCLUDED.source_idx
+                """),
+                forecasts,
+            )
+        except Exception:
+            for f in forecasts:
+                conn.execute(
+                    text("""
+                        DELETE FROM aqi_forecast_daily
+                        WHERE city=:city AND pollutant=:pollutant AND day=:day AND source=:source
+                    """),
+                    f,
+                )
+            conn.execute(
+                text("""
+                    INSERT INTO aqi_forecast_daily
+                    (city, pollutant, day, avg, min, max, source, source_idx)
+                    VALUES
+                    (:city, :pollutant, :day, :avg, :min, :max, :source, :source_idx)
+                """),
+                forecasts,
+            )
+    else:
+        try:
+            conn.execute(
+                text("""
+                    INSERT INTO aqi_forecast_daily
+                    (city, pollutant, day, avg, min, max, source_idx)
+                    VALUES
+                    (:city, :pollutant, :day, :avg, :min, :max, :source_idx)
+                    ON CONFLICT (city, pollutant, day) DO UPDATE SET
+                      avg=EXCLUDED.avg,
+                      min=EXCLUDED.min,
+                      max=EXCLUDED.max,
+                      source_idx=EXCLUDED.source_idx
+                """),
+                forecasts,
+            )
+        except Exception:
+            for f in forecasts:
+                conn.execute(
+                    text("""
+                        DELETE FROM aqi_forecast_daily
+                        WHERE city=:city AND pollutant=:pollutant AND day=:day
+                    """),
+                    f,
+                )
+            conn.execute(
+                text("""
+                    INSERT INTO aqi_forecast_daily
+                    (city, pollutant, day, avg, min, max, source_idx)
+                    VALUES
+                    (:city, :pollutant, :day, :avg, :min, :max, :source_idx)
+                """),
+                forecasts,
+            )
 
 @functions_framework.cloud_event
 def gcs_to_postgres(cloud_event):
@@ -178,20 +273,7 @@ def gcs_to_postgres(cloud_event):
 
             forecasts = _extract_forecasts(payload)
             if forecasts:
-                conn.execute(
-                    text("""
-                    INSERT INTO aqi_forecast_daily
-                    (city, pollutant, day, avg, min, max, source_idx)
-                    VALUES
-                    (:city, :pollutant, :day, :avg, :min, :max, :source_idx)
-                    ON CONFLICT (city, pollutant, day) DO UPDATE SET
-                      avg=EXCLUDED.avg,
-                      min=EXCLUDED.min,
-                      max=EXCLUDED.max,
-                      source_idx=EXCLUDED.source_idx
-                    """),
-                    forecasts,
-                )
+                _upsert_forecasts(conn, forecasts)
 
         print(f"Upserted observation and {len(forecasts or [])} forecast rows from {bucket}/{name}")
     except Exception as e:
