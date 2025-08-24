@@ -57,6 +57,20 @@ _monitoring_client: Optional[monitoring_v3.MetricServiceClient] = None
 last_vertex_error: Optional[str] = None  
 VERTEX_SKIP_REGISTER_IF_EXISTS = os.getenv("VERTEX_SKIP_REGISTER_IF_EXISTS", "true").lower() == "true"  # new
 
+def _read_env_or_file(name: str, default: Optional[str] = None) -> Optional[str]:
+    """
+    Returns secret from ENV[name] or, if empty, from ENV[name+'_FILE'] path.
+    """
+    val = os.getenv(name, default)
+    if not val:
+        file_path = os.getenv(f"{name}_FILE")
+        if file_path and os.path.isfile(file_path):
+            try:
+                val = Path(file_path).read_text(encoding="utf-8").strip()
+            except Exception:
+                val = default
+    return val
+
 GEMINI_API_KEY = _read_env_or_file("GEMINI_API_KEY")
 EXTERNAL_LATEST_OBS_URL = os.getenv(
     "EXTERNAL_LATEST_OBS_URL",
@@ -72,20 +86,6 @@ logging.info({
 SUPPORTED_VERTEX_FILES = {
     "model.pkl", "model.joblib", "model.bst", "model.mar", "saved_model.pb", "saved_model.pbtxt"
 }
-
-def _read_env_or_file(name: str, default: Optional[str] = None) -> Optional[str]:
-    """
-    Returns secret from ENV[name] or, if empty, from ENV[name+'_FILE'] path.
-    """
-    val = os.getenv(name, default)
-    if not val:
-        file_path = os.getenv(f"{name}_FILE")
-        if file_path and os.path.isfile(file_path):
-            try:
-                val = Path(file_path).read_text(encoding="utf-8").strip()
-            except Exception:
-                val = default
-    return val
 
 def _find_vertex_artifact_path(base_dir: str) -> Optional[str]:
     """
@@ -996,8 +996,8 @@ def _build_activity_prompt(req: ActivityRequest, obs: Dict[str, Any], aqi_info: 
     prefs = ", ".join(req.user_profile.activityPreferences) or "No specific preferences"
 
     guidance = f"""
-You are an assistant that recommends kid-friendly activities factoring current air quality.
-Return ONLY a strict JSON object (no markdown, no comments). Use this JSON schema:
+Anda adalah asisten yang merekomendasikan aktivitas ramah anak dengan mempertimbangkan kualitas udara saat ini.
+Balas HANYA berupa objek JSON ketat (tanpa markdown, tanpa komentar). Gunakan skema JSON berikut:
 {{
   "recommendation_level": "string",
   "summary": "string",
@@ -1010,22 +1010,24 @@ Return ONLY a strict JSON object (no markdown, no comments). Use this JSON schem
   "current_aqi": number
 }}
 
-Context:
-- City: {city}
-- Child: name="{req.user_profile.childName}", age="{req.user_profile.childAge}"
-- Health sensitivities: {sensitivities}
-- Preferences: {prefs}
-- Latest observation timestamp: {latest_ts}
-- Latest metrics: pm25={pm25_val}, temp={temp_val}, wind={wind_val}, humidity={hum_val}
-- Computed AQI (from PM2.5): {aqi_info.get("aqi")} ({aqi_info.get("level")})
+Konteks:
+- Kota: {city}
+- Anak: name="{req.user_profile.childName}", age="{req.user_profile.childAge}"
+- Sensitivitas kesehatan: {sensitivities}
+- Preferensi: {prefs}
+- Waktu observasi terbaru: {latest_ts}
+- Metrik terbaru: pm25={pm25_val}, temp={temp_val}, wind={wind_val}, humidity={hum_val}
+- AQI terhitung (dari PM2.5): {aqi_info.get("aqi")} ({aqi_info.get("level")})
 
-Instructions:
-- Tailor the recommendation to age and sensitivities (e.g., asthma -> shorter outdoor durations or indoor options if AQI is high).
-- Choose a plausible attraction or generic safe place near the coordinates (e.g., city park, indoor play area). Use clear Indonesian place naming if applicable.
-- Keep "summary" warm and concise.
-- Set "recommendation_level" aligned with AQI level above.
-- Cap outdoor duration and give a practical safety tip if AQI is not Good.
-- Respond with valid, minified JSON only.
+Instruksi:
+- Tulis SELURUH jawaban dalam Bahasa Indonesia.
+- Rekomendasikan tempat/aktivitas YANG HANYA berada di Kota Malang (contoh: Alun-Alun Malang, taman kota, museum/ruang bermain dalam ruangan di Malang). Jangan rekomendasikan lokasi di luar Malang.
+- Sesuaikan dengan usia dan sensitivitas (contoh: asma -> durasi luar ruang lebih singkat atau opsi indoor jika AQI tinggi).
+- Buat "summary" singkat dan hangat.
+- Selaraskan "recommendation_level" dengan tingkat AQI di atas.
+- Jika AQI bukan "Good", batasi durasi luar ruang dan berikan tips keselamatan yang praktis.
+- Pastikan "recommended_activity.location_name" menyebut lokasi di Malang.
+- Balas dengan JSON valid dan ringkas (minified).
 """.strip()
     return guidance
 
