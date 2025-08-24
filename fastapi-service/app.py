@@ -1,4 +1,4 @@
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 import pandas as pd
 import os
 from pm25_predictor import PM25Predictor
@@ -12,14 +12,38 @@ from google.cloud import logging as gcloud_logging
 from google.cloud import monitoring_v3
 from google.api import metric_pb2, monitored_resource_pb2
 from google.protobuf import timestamp_pb2
+from pydantic import BaseModel
+from typing import List, Union, Dict, Any, Optional
+import json
+from dotenv import load_dotenv
+from pathlib import Path
+from fastapi.middleware.cors import CORSMiddleware
+import httpx
+
+try:
+    import google.generativeai as genai
+except Exception:
+    genai = None
 
 app = FastAPI(title="PM2.5 Forecast API")
+
+# CORS for web clients
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["http://localhost:3000", "https://airkid.vercel.app"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 predictor = PM25Predictor("models")
 
 db_pool: Optional[asyncpg.pool.Pool] = None
 last_db_error: Optional[str] = None
 last_db_url_masked: Optional[str] = None
+
+ENV_FILE = Path(__file__).resolve().parent / ".env"
+load_dotenv(dotenv_path=ENV_FILE, override=False)
 
 GCP_PROJECT = os.getenv("GCP_PROJECT")
 GCP_LOCATION = os.getenv("GCP_LOCATION")
@@ -33,9 +57,35 @@ _monitoring_client: Optional[monitoring_v3.MetricServiceClient] = None
 last_vertex_error: Optional[str] = None  
 VERTEX_SKIP_REGISTER_IF_EXISTS = os.getenv("VERTEX_SKIP_REGISTER_IF_EXISTS", "true").lower() == "true"  # new
 
+GEMINI_API_KEY = _read_env_or_file("GEMINI_API_KEY")
+EXTERNAL_LATEST_OBS_URL = os.getenv(
+    "EXTERNAL_LATEST_OBS_URL",
+    "https://fastapi-service-641497729175.asia-southeast2.run.app/latest-observation?city=Malang%2C%20Indonesia",
+)
+# Log non-secret config at import/init time
+logging.info({
+    "event": "config_init",
+    "gemini_configured": bool(GEMINI_API_KEY),
+    "external_obs_url": EXTERNAL_LATEST_OBS_URL,
+})
+
 SUPPORTED_VERTEX_FILES = {
     "model.pkl", "model.joblib", "model.bst", "model.mar", "saved_model.pb", "saved_model.pbtxt"
 }
+
+def _read_env_or_file(name: str, default: Optional[str] = None) -> Optional[str]:
+    """
+    Returns secret from ENV[name] or, if empty, from ENV[name+'_FILE'] path.
+    """
+    val = os.getenv(name, default)
+    if not val:
+        file_path = os.getenv(f"{name}_FILE")
+        if file_path and os.path.isfile(file_path):
+            try:
+                val = Path(file_path).read_text(encoding="utf-8").strip()
+            except Exception:
+                val = default
+    return val
 
 def _find_vertex_artifact_path(base_dir: str) -> Optional[str]:
     """
@@ -141,7 +191,6 @@ def _register_model_in_vertex(models_dir: str = "models", display_name: Optional
     try:
         dn = _display_name(display_name)
 
-        # Skip if a model with the same display_name already exists (prevents duplicates)
         if VERTEX_SKIP_REGISTER_IF_EXISTS:
             try:
                 existing = aiplatform.Model.list(filter=f'display_name="{dn}"')
@@ -317,7 +366,7 @@ async def root():
         }
     }
 
-@app.get("/get-forecast")
+@app.get("/get-forecast",tags=["external"])
 async def get_forecast(
     city: str = "Malang, Indonesia",
     pollutant: str = "pm25",
@@ -669,7 +718,7 @@ async def forecast_model(city: str = "Malang, Indonesia", persist: bool = False)
         if persist and forecast:
             upsert_sql = """
               INSERT INTO aqi_forecast_daily (city, pollutant, day, avg, min, max, source, source_idx)
-              VALUES ($1, 'pm25', $2, $3, $4, $5, 'model', NULL)
+              VALUES ($1, 'pm25', $2, $3, $4, $5, $6, $7, NULL)
               ON CONFLICT (city, pollutant, day, source)
               DO UPDATE SET avg = EXCLUDED.avg,
                             min = EXCLUDED.min,
@@ -686,6 +735,7 @@ async def forecast_model(city: str = "Malang, Indonesia", persist: bool = False)
                             item["avg"],
                             item["min"],
                             item["max"],
+                            "model"
                         )
                         for item in forecast
                     ],
@@ -781,3 +831,296 @@ async def vertex_register(models_dir: str = "models", display_name: Optional[str
     Trigger Vertex Model upload. Optionally override artifact_path (file or SavedModel directory).
     """
     return _register_model_in_vertex(models_dir=models_dir, display_name=display_name, artifact_path=artifact_path)
+
+@app.get("/latest-observation", tags=["external"])
+async def latest_observation(city: str = "Malang, Indonesia"):
+    """
+    Return the latest available values for pm25, temp, wind, and humidity.
+    Tries city-specific first, then falls back to global latest non-null.
+    """
+    if not db_pool:
+        return {"status": "unavailable", "message": "Database not configured."}
+
+    metric_to_column = {
+        "pm25": "pm25",
+        "temp": "temperature",
+        "wind": "wind",
+        "humidity": "humidity",
+    }
+    metrics = ["pm25", "temp", "wind", "humidity"]
+
+    async def _fetch_latest_metric_value(conn: asyncpg.Connection, col: str, city_name: str):
+        row = await conn.fetchrow(
+            f"""
+            SELECT {col} AS value, observed_at
+            FROM aqi_observations
+            WHERE city = $1 AND {col} IS NOT NULL
+            ORDER BY observed_at DESC
+            LIMIT 1
+            """,
+            city_name,
+        )
+        if row:
+            return row["value"], row["observed_at"]
+        row = await conn.fetchrow(
+            f"""
+            SELECT {col} AS value, observed_at
+            FROM aqi_observations
+            WHERE {col} IS NOT NULL
+            ORDER BY observed_at DESC
+            LIMIT 1
+            """
+        )
+        if row:
+            return row["value"], row["observed_at"]
+        return None, None
+
+    try:
+        async with db_pool.acquire() as conn:
+            rows = await conn.fetch(
+                """
+                SELECT column_name
+                FROM information_schema.columns
+                WHERE table_schema = 'public'
+                  AND table_name = 'aqi_observations'
+                  AND column_name = ANY($1::text[])
+                """,
+                list(set(metric_to_column.values())),
+            )
+            existing_cols = {r["column_name"] for r in rows}
+
+            data = {}
+            latest_ts = None
+
+            for key in metrics:
+                col = metric_to_column.get(key, key)
+                if col not in existing_cols:
+                    data[key] = {"value": None, "observed_at": None}
+                    continue
+
+                raw_val, ts = await _fetch_latest_metric_value(conn, col, city)
+
+                if raw_val is None:
+                    norm_val = None
+                else:
+                    if key == "pm25":
+                        norm_val = int(round(float(raw_val)))
+                    else:
+                        norm_val = float(raw_val)
+
+                data[key] = {
+                    "value": norm_val,
+                    "observed_at": ts.isoformat() if ts else None,
+                }
+                if ts and (latest_ts is None or ts > latest_ts):
+                    latest_ts = ts
+
+            status = "success" if any(v["value"] is not None for v in data.values()) else "empty"
+            return {
+                "status": status,
+                "city": city,
+                "data": data,
+                "latest_observed_at": latest_ts.isoformat() if latest_ts else None,
+            }
+    except Exception as e:
+        return {"status": "error", "message": str(e)}
+
+async def _fetch_latest_observation_external() -> Dict[str, Any]:
+    """
+    Fetch latest observation from the external endpoint (Malang fixed).
+    """
+    try:
+        logging.info({"event": "external_obs_request", "url": EXTERNAL_LATEST_OBS_URL})
+        async with httpx.AsyncClient(timeout=8.0) as client:
+            resp = await client.get(EXTERNAL_LATEST_OBS_URL)
+            resp.raise_for_status()
+            data = resp.json()
+            logging.info({
+                "event": "external_obs_response",
+                "status_code": resp.status_code,
+                "latest_observed_at": data.get("latest_observed_at"),
+                "pm25": data.get("data", {}).get("pm25", {}).get("value"),
+            })
+            return data
+    except httpx.HTTPError as e:
+        logging.warning({"event": "external_obs_http_error", "error": str(e)})
+        raise HTTPException(status_code=502, detail=f"Failed to fetch external latest observation: {str(e)}")
+    except Exception as e:
+        logging.exception("external_obs_unknown_error")
+        raise HTTPException(status_code=502, detail=f"Failed to fetch external latest observation: {str(e)}")
+
+# -------------------- Activity recommendation models and helpers --------------------
+class UserProfile(BaseModel):
+    childName: str
+    childAge: Union[str, int]
+    healthSensitivities: List[str] = []
+    activityPreferences: List[str] = []
+
+class ActivityRequest(BaseModel):
+    user_profile: Optional[UserProfile] = None
+    city: Optional[str] = "Malang, Indonesia"
+
+def _pm25_to_aqi(conc: float) -> Dict[str, Any]:
+    """
+    Convert PM2.5 (µg/m3) to AQI using US EPA breakpoints.
+    Returns: { aqi: int, level: str }
+    """
+    try:
+        c = max(0.0, float(conc))
+    except Exception:
+        return {"aqi": None, "level": None}
+    bps = [
+        (0.0, 12.0, 0, 50, "Good"),
+        (12.1, 35.4, 51, 100, "Moderate Caution"),
+        (35.5, 55.4, 101, 150, "Caution for Sensitive Groups"),
+        (55.5, 150.4, 151, 200, "Unhealthy Caution"),
+        (150.5, 250.4, 201, 300, "Very Unhealthy - Avoid Outdoor"),
+        (250.5, 350.4, 301, 400, "Hazardous - Stay Indoors"),
+        (350.5, 500.4, 401, 500, "Hazardous - Stay Indoors"),
+    ]
+    for Cl, Ch, Il, Ih, lvl in bps:
+        if c <= Ch:
+            aqi = int(round((Ih - Il) / (Ch - Cl) * (c - Cl) + Il))
+            return {"aqi": aqi, "level": lvl}
+    return {"aqi": 500, "level": "Hazardous - Stay Indoors"}
+
+def _build_activity_prompt(req: ActivityRequest, obs: Dict[str, Any], aqi_info: Dict[str, Any]) -> str:
+    city = "Malang, Indonesia"
+    pm25_val = obs.get("data", {}).get("pm25", {}).get("value")
+    temp_val = obs.get("data", {}).get("temp", {}).get("value")
+    wind_val = obs.get("data", {}).get("wind", {}).get("value")
+    hum_val = obs.get("data", {}).get("humidity", {}).get("value")
+    latest_ts = obs.get("latest_observed_at")
+
+    sensitivities = ", ".join(req.user_profile.healthSensitivities) or "None specified"
+    prefs = ", ".join(req.user_profile.activityPreferences) or "No specific preferences"
+
+    guidance = f"""
+Anda adalah asisten yang merekomendasikan aktivitas ramah anak dengan mempertimbangkan kualitas udara saat ini.
+Balas HANYA berupa objek JSON ketat (tanpa markdown, tanpa komentar). Gunakan skema JSON berikut:
+{{
+  "recommendation_level": "string",
+  "summary": "string",
+  "recommended_activity": {{
+    "name": "string",
+    "location_name": "string",
+    "developmental_benefit": "string",
+    "safety_tip": "string"
+  }},
+  "current_aqi": number
+}}
+
+Konteks:
+- Kota: {city}
+- Anak: name="{req.user_profile.childName}", age="{req.user_profile.childAge}"
+- Sensitivitas kesehatan: {sensitivities}
+- Preferensi: {prefs}
+- Waktu observasi terbaru: {latest_ts}
+- Metrik terbaru: pm25={pm25_val}, temp={temp_val}, wind={wind_val}, humidity={hum_val}
+- AQI terhitung (dari PM2.5): {aqi_info.get("aqi")} ({aqi_info.get("level")})
+
+Instruksi:
+- Tulis SELURUH jawaban dalam Bahasa Indonesia.
+- Rekomendasikan tempat/aktivitas YANG HANYA berada di Kota Malang (contoh: Alun-Alun Malang, taman kota, museum/ruang bermain dalam ruangan di Malang). Jangan rekomendasikan lokasi di luar Malang.
+- Sesuaikan dengan usia dan sensitivitas (contoh: asma -> durasi luar ruang lebih singkat atau opsi indoor jika AQI tinggi).
+- Buat "summary" singkat dan hangat.
+- Selaraskan "recommendation_level" dengan tingkat AQI di atas.
+- Jika AQI bukan "Good", batasi durasi luar ruang dan berikan tips keselamatan yang praktis.
+- Pastikan "recommended_activity.location_name" menyebut lokasi di Malang.
+- Balas dengan JSON valid dan ringkas (minified).
+""".strip()
+    return guidance
+
+def _parse_gemini_json(raw: str) -> Optional[Dict[str, Any]]:
+    if not raw:
+        return None
+    txt = raw.strip()
+    if txt.startswith("```"):
+        lines = [l for l in txt.splitlines() if not l.strip().startswith("```")]
+        txt = "\n".join(lines).strip()
+    try:
+        return json.loads(txt)
+    except Exception:
+        try:
+            start = txt.find("{")
+            end = txt.rfind("}")
+            if start >= 0 and end > start:
+                return json.loads(txt[start:end+1])
+        except Exception:
+            return None
+
+@app.post("/recommend-activity", tags=["external"])
+async def recommend_activity(req: ActivityRequest):
+    """
+    Recommend an activity using Gemini, enriched with latest-observation.
+    If user_profile is missing, fill it with defaults. No rule-based fallback.
+    """
+    obs = await _fetch_latest_observation_external()
+
+    pm25_val = None
+    try:
+        pm25_val = obs.get("data", {}).get("pm25", {}).get("value")
+    except Exception:
+        pm25_val = None
+    aqi_info = _pm25_to_aqi(pm25_val) if pm25_val is not None else {"aqi": None, "level": None}
+
+    default_profile = UserProfile(
+        childName="Budi",
+        childAge="6",
+        healthSensitivities=["Asthma or other respiratory sensitivities"],
+        activityPreferences=["Loves active & energetic play"],
+    )
+    normalized_req = ActivityRequest(
+        user_profile=req.user_profile or default_profile,
+    )
+
+    if not GEMINI_API_KEY or not genai:
+        logging.warning({
+            "event": "gemini_not_configured",
+            "gemini_import_ok": bool(genai),
+            "gemini_key_present": bool(GEMINI_API_KEY),
+        })
+        raise HTTPException(status_code=503, detail="Gemini not configured")
+
+    try:
+        genai.configure(api_key=GEMINI_API_KEY)
+        model = genai.GenerativeModel("gemini-2.5-flash-lite")
+        prompt = _build_activity_prompt(normalized_req, obs, aqi_info)
+        logging.info({
+            "event": "gemini_request",
+            "model": "gemini-2.5-flash-lite",
+            "pm25": pm25_val,
+            "aqi": aqi_info.get("aqi"),
+            "level": aqi_info.get("level"),
+        })
+        resp = model.generate_content(prompt)
+        parsed = _parse_gemini_json(getattr(resp, "text", "") or "")
+        if not parsed:
+            logging.warning({"event": "gemini_non_json_output"})
+            raise HTTPException(status_code=502, detail="Model returned non-JSON output")
+
+        parsed.setdefault("recommendation_level", aqi_info.get("level") or "Moderate Caution")
+        ra = parsed.setdefault("recommended_activity", {})
+        ra.setdefault("name", "Family-Friendly Activity")
+        ra.setdefault("location_name", "Malang, Indonesia")
+        ra.setdefault("developmental_benefit", "Supports age-appropriate development.")
+        ra.setdefault("safety_tip", "Follow local air quality guidance.")
+        try:
+            if pm25_val is not None:
+                parsed["current_aqi"] = int(round(float(pm25_val)))
+            else:
+                parsed["current_aqi"] = int(parsed.get("current_aqi") or (aqi_info.get("aqi") or 75))
+        except Exception:
+            parsed["current_aqi"] = int(aqi_info.get("aqi") or 75)
+
+        logging.info({
+            "event": "recommendation_success",
+            "current_aqi_reported": parsed.get("current_aqi"),
+            "recommendation_level": parsed.get("recommendation_level"),
+        })
+        return parsed
+    except HTTPException:
+        raise
+    except Exception as e:
+        logging.exception("gemini_call_failed")
+        raise HTTPException(status_code=502, detail=f"Gemini call failed: {str(e)}")
