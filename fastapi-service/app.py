@@ -996,8 +996,8 @@ def _build_activity_prompt(req: ActivityRequest, obs: Dict[str, Any], aqi_info: 
     prefs = ", ".join(req.user_profile.activityPreferences) or "No specific preferences"
 
     guidance = f"""
-Anda adalah asisten yang merekomendasikan aktivitas ramah anak dengan mempertimbangkan kualitas udara saat ini.
-Balas HANYA berupa objek JSON ketat (tanpa markdown, tanpa komentar). Gunakan skema JSON berikut:
+You are an assistant that recommends kid-friendly activities factoring current air quality.
+Return ONLY a strict JSON object (no markdown, no comments). Use this JSON schema:
 {{
   "recommendation_level": "string",
   "summary": "string",
@@ -1010,24 +1010,22 @@ Balas HANYA berupa objek JSON ketat (tanpa markdown, tanpa komentar). Gunakan sk
   "current_aqi": number
 }}
 
-Konteks:
-- Kota: {city}
-- Anak: name="{req.user_profile.childName}", age="{req.user_profile.childAge}"
-- Sensitivitas kesehatan: {sensitivities}
-- Preferensi: {prefs}
-- Waktu observasi terbaru: {latest_ts}
-- Metrik terbaru: pm25={pm25_val}, temp={temp_val}, wind={wind_val}, humidity={hum_val}
-- AQI terhitung (dari PM2.5): {aqi_info.get("aqi")} ({aqi_info.get("level")})
+Context:
+- City: {city}
+- Child: name="{req.user_profile.childName}", age="{req.user_profile.childAge}"
+- Health sensitivities: {sensitivities}
+- Preferences: {prefs}
+- Latest observation timestamp: {latest_ts}
+- Latest metrics: pm25={pm25_val}, temp={temp_val}, wind={wind_val}, humidity={hum_val}
+- Computed AQI (from PM2.5): {aqi_info.get("aqi")} ({aqi_info.get("level")})
 
-Instruksi:
-- Tulis SELURUH jawaban dalam Bahasa Indonesia.
-- Rekomendasikan tempat/aktivitas YANG HANYA berada di Kota Malang (contoh: Alun-Alun Malang, taman kota, museum/ruang bermain dalam ruangan di Malang). Jangan rekomendasikan lokasi di luar Malang.
-- Sesuaikan dengan usia dan sensitivitas (contoh: asma -> durasi luar ruang lebih singkat atau opsi indoor jika AQI tinggi).
-- Buat "summary" singkat dan hangat.
-- Selaraskan "recommendation_level" dengan tingkat AQI di atas.
-- Jika AQI bukan "Good", batasi durasi luar ruang dan berikan tips keselamatan yang praktis.
-- Pastikan "recommended_activity.location_name" menyebut lokasi di Malang.
-- Balas dengan JSON valid dan ringkas (minified).
+Instructions:
+- Tailor the recommendation to age and sensitivities (e.g., asthma -> shorter outdoor durations or indoor options if AQI is high).
+- Choose a plausible attraction or generic safe place near the coordinates (e.g., city park, indoor play area). Use clear Indonesian place naming if applicable.
+- Keep "summary" warm and concise.
+- Set "recommendation_level" aligned with AQI level above.
+- Cap outdoor duration and give a practical safety tip if AQI is not Good.
+- Respond with valid, minified JSON only.
 """.strip()
     return guidance
 
